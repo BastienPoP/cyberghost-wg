@@ -172,10 +172,6 @@ The same lists as in CyberGhost's apps:
 | `gaming` | For gaming | CyberGhost's gaming servers, in a few countries (`countries --type gaming`: France, Germany, the UK and the US in October 2026) |
 | `nospy` | NoSpy servers | CyberGhost's own servers in Bucharest, Romania; no `--country` needed |
 
-Measured from France in October 2026, the gaming servers of Paris and Frankfurt
-had the same latency and jitter as the other servers of the same city: for
-games, the distance to the server matters more than its type.
-
 ### Interactive mode
 
 `cyberghost-wg conf -i` asks, in turn, for the server type, the country (by
