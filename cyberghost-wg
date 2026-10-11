@@ -1,0 +1,1243 @@
+#!/usr/bin/env python3
+"""cyberghost-wg - WireGuard configurations for CyberGhost VPN, without the official client.
+
+Unofficial and not affiliated with CyberGhost. It makes the same calls as the
+official Linux client 1.5.0, to an undocumented API that may change at any time:
+
+  login    POST   /my/account/jwt          account JWT
+           POST   /my/devices              device token + secret (created once)
+  countries GET   /my/servers/filters/75   torrent countries, or /73 for all servers
+  servers  GET    /my/servers/filters/71   torrent servers, /74 all servers, /95 NoSpy servers
+  services GET    /my/servers/filters/76   streaming services, then /72 for the servers of one
+  gaming   GET    /my/servers/filters/86   server groups: the gaming group's hostname per country
+  conf     GET    https://<instance>.cg-dialup.net:1337/addKey?pubkey=...
+                                           (HTTP Basic auth with the device token + secret)
+  logout   DELETE /my/devices/<id>
+
+A key registered with addKey must be used within a few minutes (refused after 5 in tests).
+Requirements: Python 3.8+, standard library only.
+"""
+
+import argparse
+import base64
+import getpass
+import http.client
+import ipaddress
+import json
+import os
+import re
+import secrets
+import shutil
+import socket
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+VERSION = "0.1.0"
+
+API_URL = "https://v2-api.cyberghostvpn.com/v2"
+# Public application key shipped in the official client (configs/api.py).
+API_KEY = "QzgDsDNUXlgF9jehkTHHtBJwwI4RyInkZQDRJfLyz"
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+              "(KHTML, like Gecko) Chrome/69.0.3497.100 Safari/537.36")
+FILTER_TORRENT = 71
+FILTER_TRAFFIC = 74
+FILTER_TORRENT_COUNTRIES = 75
+FILTER_TRAFFIC_COUNTRIES = 73
+FILTER_STREAMING_SERVICES = 76
+FILTER_STREAMING = 72  # with filter_content_id: the servers of one streaming service
+FILTER_NOSPY = 95  # CyberGhost's own servers in Bucharest, listed as "Nospybucharest-S409-i01"
+# Server groups, e.g. {"name": "Gaming servers", "countrycode": "DE", "url": "19-DE.cg-dialup.net"}: the
+# group hostname resolves to the group's servers, found by their address in the country's list.
+FILTER_GROUPS = 86
+GROUP_URL_RE = re.compile(r"[0-9]+-[A-Za-z]{2}\.cg-dialup\.net")
+SERVER_TYPES = ("all", "torrent", "streaming", "gaming", "nospy")
+TYPE_LABELS = {"all": "all: every server", "torrent": "torrent: for torrenting",
+               "streaming": "streaming: for one streaming service",
+               "gaming": "gaming: CyberGhost's gaming servers, in a few countries",
+               "nospy": "nospy: NoSpy servers, run by CyberGhost itself in Romania"}
+NOSPY_COUNTRY = "RO"
+# Server names the API prefixes, the hostname has not: Nospybucharest-S409-i01 is bucharest-s409-i01.
+NAME_PREFIXES = ("nospyproxy", "nospy")
+ADDKEY_PORT = 1337
+DEFAULT_DNS = "10.101.0.243"  # fallback used by the official client
+# Everything through the tunnel. ::/0 too, although CyberGhost has no IPv6: with wg-quick
+# it sends IPv6 into the tunnel, where it is dropped, instead of leaking around it
+# (the official client disables IPv6 on the host for the same reason).
+DEFAULT_ALLOWED_IPS = "0.0.0.0/0, ::/0"
+TIMEOUT = 20
+# Seconds to wait before each new attempt when the API is unreachable (network not up yet at boot).
+NETWORK_RETRIES = (5, 15)
+# The API answers HTTP 429 when requests come too fast (5 country lists in 2 seconds), for about a minute.
+RATE_LIMIT_WAIT = 60
+# Server names as they appear in the API and in <instance>.cg-dialup.net.
+INSTANCE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,62}")
+# The addKey certificate names the rack: zurich-s404-i06 is served by zurich-rack404.nodes.gen4.ninja.
+NODE_CERT_SUFFIX = ".nodes.gen4.ninja"
+# CyberGhost drops a key no tunnel has used for a few minutes (refused after 5 in tests).
+KEY_DEADLINE = 4 * 60
+KEY_WARNING = ("CyberGhost drops a new key if no tunnel uses it within a few minutes: "
+               "only generate the configuration when you are ready to connect.")
+
+# CyberGhost Root CA (cyberghost/wireguard/ca.crt in the official client, valid until 2037).
+# The addKey certificate is issued to the node's internal name, so the chain is checked
+# against this CA but the hostname is not, exactly as the official client does.
+CG_WG_CA = """-----BEGIN CERTIFICATE-----
+MIIGWjCCBEKgAwIBAgIJAJxUG61mxDS7MA0GCSqGSIb3DQEBDQUAMHsxCzAJBgNV
+BAYTAlJPMRIwEAYDVQQHEwlCdWNoYXJlc3QxGDAWBgNVBAoTD0N5YmVyR2hvc3Qg
+Uy5BLjEbMBkGA1UEAxMSQ3liZXJHaG9zdCBSb290IENBMSEwHwYJKoZIhvcNAQkB
+FhJpbmZvQGN5YmVyZ2hvc3Qucm8wHhcNMTcwNjE5MDgxNzI1WhcNMzcwNjE0MDgx
+NzI1WjB7MQswCQYDVQQGEwJSTzESMBAGA1UEBxMJQnVjaGFyZXN0MRgwFgYDVQQK
+Ew9DeWJlckdob3N0IFMuQS4xGzAZBgNVBAMTEkN5YmVyR2hvc3QgUm9vdCBDQTEh
+MB8GCSqGSIb3DQEJARYSaW5mb0BjeWJlcmdob3N0LnJvMIICIjANBgkqhkiG9w0B
+AQEFAAOCAg8AMIICCgKCAgEA7O8+mji2FlQhJXn/G4VLrKPjGtxgQBAdjo0dZEQz
+KX08q14dLkslmOLgShStWKrOiLXGAvB1rPvvk613jtA0KjQLpgyLy9lIWohQKYjj
+5jrJYXMZMkbSHBYI9L8L7iezBEFYrjYKdDo51nq99wRFhKdbyKKjDh3e2L2SVEZL
+T1ogkK5gWzjvH+mjjtjUUicK+YjGwWOz6I+KKaG4Ve/D/cE6nCLbhHIMMnargZEu
+7sqA6BFeS4kEP/ZdCZoTSX2n43XV1q63nJt/v0KDetbZDciFVW9h9SVPG4qT44p0
+550N+Mom7zTX7S/ID5T9dplgU8sRGtIMrG0cIMD9zmpFgUnMusCrR7jJFr0sMAve
+TbgZg95LmstV6R6WKZkSFdUrE0DHl4dHoZvTFX+1LhwhHgjgDLaosX0vhG/C/7Lp
+oVWimd6RRQT3M9o4Fa1TuhfvBzQ20QHrmRV/yKvGNK0xckZ6EZ/QY7Z55ORU15Tg
+ab4ebnblYPWoEmn0mIYP3LFFeoR5OS1EX7+j4kPv+bwPGsmpHjxmZyq2Y7sJBpbO
+CJgbkn52WZdPBIRDpPdIHQ8pAJC4T0iMK9xvAwWNl/V6EYYNpR97osyEDXn+BTdA
+HlhJ5fck9KlwI9mb1Kg1bhbvbmaIAiOLenSULYf3j6rI1ygo3R2cCyybtuAq8M7z
+0OECAwEAAaOB4DCB3TAdBgNVHQ4EFgQU6tdK1g/He5qzjeAoM5eHt4in9iUwga0G
+A1UdIwSBpTCBooAU6tdK1g/He5qzjeAoM5eHt4in9iWhf6R9MHsxCzAJBgNVBAYT
+AlJPMRIwEAYDVQQHEwlCdWNoYXJlc3QxGDAWBgNVBAoTD0N5YmVyR2hvc3QgUy5B
+LjEbMBkGA1UEAxMSQ3liZXJHaG9zdCBSb290IENBMSEwHwYJKoZIhvcNAQkBFhJp
+bmZvQGN5YmVyZ2hvc3Qucm+CCQCcVButZsQ0uzAMBgNVHRMEBTADAQH/MA0GCSqG
+SIb3DQEBDQUAA4ICAQDNyQ92kj4qiNjnHk99qvnFw9qGfwB9ofaPL74zh0G5hEe3
+Wgb2o4fqUGnvUNgOu53gJksz3DcPQ8t40wfmm9I1Z8tiM9qrqvkuQ+nKcLgdooXt
+EsTybPIYDZ2cWR/5E0TKRvC7RFzKgQ4D77Vbi4TdaHiDV7ZNfU1iLCoBGcYm80hc
+UHEs5KIVLwUmcSOTmbZBySJxcSD0yUpS7nlZGwLY6VQrU+JFwDSisbXT4DXf3iSz
+p7FzW0/u/SFvWsPHrjE0hkPoZPalYvouaJEHKAhip0ZwSmitlxbBnmm8+K/3c9mL
+A5/uXrirfpuhhs8V3lyV2mczVtSiTl6gpi88gc//JY80JeHdupjO25T3XEzY9cpx
+ecmkWaUEjLMx4wVoXQuUiPonfILM6OLwi+zUS8gQErdFeGvcQXbncPa4SdJuHkF8
+lgiX2i8S8fPGdXvU37E9bdAXwP5nZriYq1s0D59Qfvz+vLXVkmyZp6ztxjKjKole
+mPMak0Y5c1Q4RjNF6tmQoFuy/ACSkWy14Tzu2dFp7UiVbGg1FOvKhfs48zC2/IUQ
+v1arqmPT/9LVq3B2DVT9UKXRUXX/f/jSSsVjkz4uUe2jUyL+XHX1nSmROTPHSAJ+
+oKf0BLnfqUxFkEUTwLnayssP2nwGgq35b7wEbTFIXdrjHGFUVQIDeERz8UThew==
+-----END CERTIFICATE-----
+"""
+
+# The API gives country codes only. ISO 3166-1 names, plus XK (Kosovo).
+COUNTRY_NAMES = dict(item.split(" ", 1) for item in """
+AD Andorra;AE United Arab Emirates;AF Afghanistan;AG Antigua and Barbuda;AI Anguilla;AL Albania;AM Armenia;
+AO Angola;AQ Antarctica;AR Argentina;AS American Samoa;AT Austria;AU Australia;AW Aruba;AX Aland Islands;
+AZ Azerbaijan;BA Bosnia and Herzegovina;BB Barbados;BD Bangladesh;BE Belgium;BF Burkina Faso;BG Bulgaria;
+BH Bahrain;BI Burundi;BJ Benin;BL Saint Barthelemy;BM Bermuda;BN Brunei;BO Bolivia;BQ Caribbean Netherlands;
+BR Brazil;BS Bahamas;BT Bhutan;BV Bouvet Island;BW Botswana;BY Belarus;BZ Belize;CA Canada;CC Cocos Islands;
+CD DR Congo;CF Central African Republic;CG Congo;CH Switzerland;CI Cote d'Ivoire;CK Cook Islands;CL Chile;
+CM Cameroon;CN China;CO Colombia;CR Costa Rica;CU Cuba;CV Cape Verde;CW Curacao;CX Christmas Island;CY Cyprus;
+CZ Czechia;DE Germany;DJ Djibouti;DK Denmark;DM Dominica;DO Dominican Republic;DZ Algeria;EC Ecuador;
+EE Estonia;EG Egypt;EH Western Sahara;ER Eritrea;ES Spain;ET Ethiopia;FI Finland;FJ Fiji;FK Falkland Islands;
+FM Micronesia;FO Faroe Islands;FR France;GA Gabon;GB United Kingdom;GD Grenada;GE Georgia;GF French Guiana;
+GG Guernsey;GH Ghana;GI Gibraltar;GL Greenland;GM Gambia;GN Guinea;GP Guadeloupe;GQ Equatorial Guinea;
+GR Greece;GS South Georgia;GT Guatemala;GU Guam;GW Guinea-Bissau;GY Guyana;HK Hong Kong;
+HM Heard and McDonald Islands;HN Honduras;HR Croatia;HT Haiti;HU Hungary;ID Indonesia;IE Ireland;IL Israel;
+IM Isle of Man;IN India;IO British Indian Ocean Territory;IQ Iraq;IR Iran;IS Iceland;IT Italy;JE Jersey;
+JM Jamaica;JO Jordan;JP Japan;KE Kenya;KG Kyrgyzstan;KH Cambodia;KI Kiribati;KM Comoros;
+KN Saint Kitts and Nevis;KP North Korea;KR South Korea;KW Kuwait;KY Cayman Islands;KZ Kazakhstan;LA Laos;
+LB Lebanon;LC Saint Lucia;LI Liechtenstein;LK Sri Lanka;LR Liberia;LS Lesotho;LT Lithuania;LU Luxembourg;
+LV Latvia;LY Libya;MA Morocco;MC Monaco;MD Moldova;ME Montenegro;MF Saint Martin;MG Madagascar;
+MH Marshall Islands;MK North Macedonia;ML Mali;MM Myanmar;MN Mongolia;MO Macao;MP Northern Mariana Islands;
+MQ Martinique;MR Mauritania;MS Montserrat;MT Malta;MU Mauritius;MV Maldives;MW Malawi;MX Mexico;MY Malaysia;
+MZ Mozambique;NA Namibia;NC New Caledonia;NE Niger;NF Norfolk Island;NG Nigeria;NI Nicaragua;NL Netherlands;
+NO Norway;NP Nepal;NR Nauru;NU Niue;NZ New Zealand;OM Oman;PA Panama;PE Peru;PF French Polynesia;
+PG Papua New Guinea;PH Philippines;PK Pakistan;PL Poland;PM Saint Pierre and Miquelon;PN Pitcairn;
+PR Puerto Rico;PS Palestine;PT Portugal;PW Palau;PY Paraguay;QA Qatar;RE Reunion;RO Romania;RS Serbia;
+RU Russia;RW Rwanda;SA Saudi Arabia;SB Solomon Islands;SC Seychelles;SD Sudan;SE Sweden;SG Singapore;
+SH Saint Helena;SI Slovenia;SJ Svalbard and Jan Mayen;SK Slovakia;SL Sierra Leone;SM San Marino;SN Senegal;
+SO Somalia;SR Suriname;SS South Sudan;ST Sao Tome and Principe;SV El Salvador;SX Sint Maarten;SY Syria;
+SZ Eswatini;TC Turks and Caicos Islands;TD Chad;TF French Southern Territories;TG Togo;TH Thailand;
+TJ Tajikistan;TK Tokelau;TL Timor-Leste;TM Turkmenistan;TN Tunisia;TO Tonga;TR Turkey;TT Trinidad and Tobago;
+TV Tuvalu;TW Taiwan;TZ Tanzania;UA Ukraine;UG Uganda;UM US Minor Outlying Islands;US United States;UY Uruguay;
+UZ Uzbekistan;VA Vatican City;VC Saint Vincent and the Grenadines;VE Venezuela;VG British Virgin Islands;
+VI US Virgin Islands;VN Vietnam;VU Vanuatu;WF Wallis and Futuna;WS Samoa;XK Kosovo;YE Yemen;YT Mayotte;
+ZA South Africa;ZM Zambia;ZW Zimbabwe""".replace("\n", "").split(";"))
+
+VERBOSE = False
+
+
+class CgError(Exception):
+    pass
+
+
+class AuthRefused(CgError):
+    """The account credentials were refused."""
+
+
+class DeviceRefused(CgError):
+    """A server refused the device: removed from the account, or a server that does not take it (gaming)."""
+
+
+def log(msg):
+    print(msg, file=sys.stderr)
+
+
+def debug(msg):
+    if VERBOSE:
+        log(f"[debug] {msg}")
+
+
+def is_root():
+    return getattr(os, "geteuid", lambda: -1)() == 0
+
+
+def ask(prompt):
+    """One answer from the terminal. Prompts go to stderr, so stdout only ever holds output."""
+    sys.stderr.write(prompt)
+    sys.stderr.flush()
+    line = sys.stdin.readline()
+    if not line:
+        raise CgError("cancelled")
+    return line.strip()
+
+
+# --- State file (device + session) -------------------------------------------
+
+def default_state_path():
+    if os.environ.get("CG_WG_STATE"):
+        return os.environ["CG_WG_STATE"]
+    base = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(base, "cyberghost-wg", "state.json")
+
+
+def load_state(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return {}
+    except ValueError as e:
+        raise CgError(f"unreadable state file {path}: {e}")
+
+
+def write_secret_file(path, data):
+    """Atomically write a 0600 file (text or bytes), creating its directory as 0700 if needed."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, mode=0o700, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".cyberghost-wg-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data if isinstance(data, bytes) else data.encode("utf-8"))
+        os.chmod(tmp, 0o600)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def save_state(path, state):
+    write_secret_file(path, json.dumps(state, indent=2) + "\n")
+
+
+# --- Credentials -------------------------------------------------------------
+
+def strip_newline(value):
+    """Drop one trailing line ending, keep any other whitespace (it may be part of a password)."""
+    for ending in ("\r\n", "\n"):
+        if value.endswith(ending):
+            return value[:-len(ending)]
+    return value
+
+
+def read_secret(path, what):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return strip_newline(f.read())
+    except OSError as e:
+        raise CgError(f"cannot read the {what} from {path}: {e.strerror}")
+
+
+def credential(what):
+    """Username or password from CG_<WHAT>_FILE, CG_<WHAT> or a systemd credential."""
+    env = f"CG_{what.upper()}"
+    if os.environ.get(env) and os.environ.get(f"{env}_FILE"):
+        raise CgError(f"{env} and {env}_FILE are both set, use only one")
+    if os.environ.get(f"{env}_FILE"):
+        return read_secret(os.environ[f"{env}_FILE"], what)
+    if os.environ.get(env):
+        return os.environ[env]
+    cred_dir = os.environ.get("CREDENTIALS_DIRECTORY")  # systemd LoadCredential=
+    if cred_dir and os.path.isfile(os.path.join(cred_dir, f"cg-{what}")):
+        return read_secret(os.path.join(cred_dir, f"cg-{what}"), what)
+    return None
+
+
+# --- Remembered credentials (encrypted with systemd-creds) -------------------
+#
+# systemd-creds encrypts with the machine key (/var/lib/systemd/credential.secret,
+# readable by root only) and the TPM2 chip when there is one. With --user (systemd 256+),
+# a credential is also bound to the user: other users cannot decrypt it, root can.
+
+CRED_NAMES = {"username": "cg-username", "password": "cg-password"}
+
+
+def remembered_path(state_path, what):
+    return os.path.join(os.path.dirname(os.path.abspath(state_path)), f"{CRED_NAMES[what]}.cred")
+
+
+def remember_unavailable():
+    """Why the credentials cannot be remembered on this machine, or None."""
+    if not shutil.which("systemd-creds"):
+        return "systemd-creds is not installed"
+    try:
+        out = subprocess.run(["systemd-creds", "--version"], capture_output=True, text=True, check=False).stdout
+        version = int(out.split()[1])  # "systemd 257 (257.13-1~deb13u1)"
+    except (OSError, IndexError, ValueError):
+        return None  # unknown version: let systemd-creds answer for itself
+    needed = 250 if is_root() else 256  # --user appeared in systemd 256
+    if version < needed:
+        return f"systemd {version} is too old to remember the credentials (needs {needed} or later" + \
+            ("" if is_root() else " when not running as root") + ")"
+    return None
+
+
+def can_remember():
+    return remember_unavailable() is None
+
+
+def systemd_creds(action, name, data):
+    cmd = ["systemd-creds"] + ([] if is_root() else ["--user"]) + [action, f"--name={name}", "-", "-"]
+    try:
+        p = subprocess.run(cmd, input=data, capture_output=True, check=False)
+    except FileNotFoundError:
+        raise CgError("systemd-creds is not installed (needed to remember the credentials)")
+    if p.returncode != 0:
+        detail = p.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise CgError(f"systemd-creds {action} failed: {detail[-1] if detail else 'exit ' + str(p.returncode)}")
+    return p.stdout
+
+
+def remember(state_path, username, password):
+    for what, value in (("username", username), ("password", password)):
+        write_secret_file(remembered_path(state_path, what),
+                          systemd_creds("encrypt", CRED_NAMES[what], value.encode("utf-8")))
+
+
+def remembered(state_path, what):
+    path = remembered_path(state_path, what)
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except FileNotFoundError:
+        return None
+    try:
+        return systemd_creds("decrypt", CRED_NAMES[what], data).decode("utf-8")
+    except CgError as e:
+        raise CgError(f"cannot read the remembered {what} ({e}): run 'cyberghost-wg login' again")
+
+
+def forget(state_path):
+    removed = False
+    for what in CRED_NAMES:
+        try:
+            os.unlink(remembered_path(state_path, what))
+            removed = True
+        except FileNotFoundError:
+            pass
+    return removed
+
+
+def get_credentials(args, use_remembered=False):
+    """Resolve the account credentials. The password is never accepted as an argument."""
+    username = getattr(args, "username", None) or credential("username")
+    if getattr(args, "password_stdin", False):
+        if not username:
+            raise CgError("--password-stdin needs --username or CG_USERNAME")
+        password = strip_newline(sys.stdin.read())
+    else:
+        password = credential("password")
+    if use_remembered and not (username and password):
+        saved = remembered(args.state, "username")
+        # Never pair another account's username with the remembered password.
+        if saved and (not username or username == saved):
+            username = saved
+            password = password or remembered(args.state, "password")
+    if not (username and password):
+        if not sys.stdin.isatty():
+            raise CgError("credentials needed: run in a terminal, or see 'cyberghost-wg login --help'")
+        username = username or ask("CyberGhost username: ")
+        password = password or getpass.getpass("CyberGhost password: ")
+    if not (username and password):
+        raise CgError("empty username or password")
+    return username, password
+
+
+# --- API v2 ------------------------------------------------------------------
+
+def retry_after(headers):
+    try:
+        return min(max(int(headers.get("Retry-After")), 1), 2 * RATE_LIMIT_WAIT)
+    except (AttributeError, TypeError, ValueError):
+        return RATE_LIMIT_WAIT
+
+
+def api(method, path, jwt=None, body=None):
+    """One API call: tries again while the network is down, and once after HTTP 429 (rate limit)."""
+    headers = {"Content-Type": "application/json", "x-app-key": API_KEY, "User-Agent": USER_AGENT}
+    if jwt:
+        headers["Authorization"] = "Bearer " + jwt
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(API_URL + path, data=data, headers=headers, method=method)
+    what = f"{method} {path.split('?')[0]}"  # the query holds the account id and location
+    network_waits, rate_limited = list(NETWORK_RETRIES), False
+    while True:
+        try:
+            with urllib.request.urlopen(req, timeout=TIMEOUT) as r:
+                code, raw, answer_headers = r.status, r.read(), r.headers
+        except urllib.error.HTTPError as e:
+            code, raw, answer_headers = e.code, e.read(), e.headers
+        except (urllib.error.URLError, OSError) as e:
+            if not network_waits:
+                raise CgError(f"API unreachable ({what}): {e}")
+            wait = network_waits.pop(0)
+            log(f"API unreachable ({e}), trying again in {wait}s ...")
+            time.sleep(wait)
+            continue
+        debug(f"{what}: HTTP {code}")
+        if code == 429 and not rate_limited:
+            rate_limited, wait = True, retry_after(answer_headers)
+            log(f"The CyberGhost API asks to slow down (HTTP 429), trying again in {wait}s ...")
+            time.sleep(wait)
+            continue
+        break
+    try:
+        payload = json.loads(raw) if raw else None
+    except ValueError:
+        payload = None
+    return code, payload
+
+
+def api_error(what, code, payload, error=CgError):
+    detail = ""
+    if isinstance(payload, dict):
+        detail = " ".join(str(payload[k]) for k in ("errorCode", "errorMessage") if payload.get(k))
+    if code == 429:
+        detail = detail or "too many requests, wait a minute"
+    return error(f"{what}: HTTP {code}{' - ' + detail if detail else ''}")
+
+
+def jwt_expiry(jwt):
+    try:
+        part = jwt.split(".")[1]
+        claims = json.loads(base64.urlsafe_b64decode(part + "=" * (-len(part) % 4)))
+        return int(claims["exp"])
+    except (AttributeError, IndexError, KeyError, TypeError, ValueError):
+        return 0
+
+
+def request_jwt(username, password):
+    code, r = api("POST", "/my/account/jwt?language=en", body={"userName": username, "password": password})
+    if code != 200 or not isinstance(r, dict) or not r.get("jwt"):
+        raise api_error("authentication refused", code, r, AuthRefused if code in (400, 401, 403) else CgError)
+    return r["jwt"]
+
+
+def ensure_jwt(state, args):
+    """A session token (JWT) valid for at least another minute, signing in again if needed."""
+    jwt = state.get("jwt")
+    if jwt and jwt_expiry(jwt) > time.time() + 60:
+        return jwt
+    log("Session expired, signing in ...")
+    try:
+        state["jwt"] = request_jwt(*get_credentials(args, use_remembered=True))
+    except AuthRefused as e:
+        if os.path.exists(remembered_path(args.state, "password")):
+            raise CgError(f"{e}. If your password changed, run 'cyberghost-wg login' again")
+        raise
+    state.pop("account", None)  # cached with the session
+    save_state(args.state, state)
+    return state["jwt"]
+
+
+def session(state, args):
+    """A valid session token and the account fields the server filters need, cached with it."""
+    jwt = ensure_jwt(state, args)
+    if not state.get("account"):
+        state["account"] = get_account(jwt)
+        save_state(args.state, state)
+    return jwt, state["account"]
+
+
+def need_device(state):
+    device = state.get("device") or {}
+    if not (device.get("token") and device.get("secret")):
+        raise CgError("no device registered, run 'cyberghost-wg login' first")
+    return device
+
+
+def need_country(args):
+    country = args.country or os.environ.get("CG_COUNTRY") or ""
+    if not (country.isalpha() and len(country) == 2):
+        raise CgError("give a 2-letter country code: --country CH (or CG_COUNTRY=CH)")
+    return country.upper()
+
+
+def server_type(args):
+    if getattr(args, "service", None):
+        return "streaming"
+    return args.type or os.environ.get("CG_TYPE") or "all"
+
+
+def need_service(args):
+    """The streaming service asked for: needed, and checked, before signing in."""
+    service = (getattr(args, "service", None) or "").strip()
+    if not service:
+        raise CgError("streaming servers belong to a service: --service 'Netflix UK' "
+                      "(see 'cyberghost-wg services')")
+    return service
+
+
+# --- Servers -----------------------------------------------------------------
+
+def get_account(jwt):
+    """The account fields the server filters need: id, location and plan id."""
+    code, acc = api("GET", "/my/account?fields=(id,userName,location,activeProduct.plan)&language=en", jwt)
+    if code != 200 or not isinstance(acc, dict):
+        raise api_error("reading the account", code, acc)
+    try:
+        plan_id = acc["activeProduct"]["plan"]["id"]
+    except (KeyError, TypeError):
+        raise CgError("this account has no active plan")
+    loc = acc.get("location") if isinstance(acc.get("location"), dict) else {}
+    return {"id": acc.get("id"), "plan_id": plan_id,
+            "location": {"latitude": loc.get("latitude"), "longitude": loc.get("longitude")}}
+
+
+def get_rows(jwt, path, what):
+    code, rows = api("GET", path, jwt)
+    if code == 204:  # what the API answers when nothing matches
+        return []
+    if code != 200 or not isinstance(rows, list):
+        raise api_error(what, code, rows)
+    return [row for row in rows if isinstance(row, dict)]
+
+
+def country_name(code):
+    return COUNTRY_NAMES.get(code, "")
+
+
+def list_countries(jwt, kind, acc=None):
+    acc = acc or get_account(jwt)
+    if kind == "nospy":
+        return [{"code": NOSPY_COUNTRY, "name": country_name(NOSPY_COUNTRY)}]
+    if kind == "gaming":
+        return sorted(({"code": c, "name": country_name(c)} for c in gaming_groups(jwt)),
+                      key=lambda c: ((c["name"] or c["code"]).lower(), c["code"]))
+    if kind == "streaming":
+        codes = {v["country"] for v in list_services(jwt, acc)}
+        return sorted(({"code": c, "name": country_name(c)} for c in codes),
+                      key=lambda c: ((c["name"] or c["code"]).lower(), c["code"]))
+    loc = acc.get("location") or {}
+    where = f"&filter_user_latitude={loc.get('latitude')}&filter_user_longitude={loc.get('longitude')}"
+    if kind == "torrent":
+        path = (f"/my/servers/filters/{FILTER_TORRENT_COUNTRIES}?filter_protocol=wireguard"
+                f"&filter_user_plans_id={acc['plan_id']}{where}")
+    else:
+        path = (f"/my/servers/filters/{FILTER_TRAFFIC_COUNTRIES}?filter_protocol=wireguard"
+                f"&filter_user_plans_id={acc['plan_id']}&filter_user_id={acc.get('id')}{where}")
+    countries = {}
+    for row in get_rows(jwt, path, "listing countries"):
+        code = str(row.get("countrycode") or "").strip().upper()
+        if len(code) == 2 and code.isalpha():
+            countries.setdefault(code, str(row.get("name") or "").strip() or country_name(code))
+    return sorted(({"code": c, "name": n} for c, n in countries.items()),
+                  key=lambda c: ((c["name"] or c["code"]).lower(), c["code"]))
+
+
+def list_services(jwt, acc=None):
+    """The streaming services CyberGhost has servers for, by country then name."""
+    acc = acc or get_account(jwt)
+    loc = acc.get("location") or {}
+    path = (f"/my/servers/filters/{FILTER_STREAMING_SERVICES}?filter_protocol=wireguard"
+            f"&filter_user_plans_id={acc['plan_id']}&filter_user_id={acc.get('id')}"
+            f"&filter_user_latitude={loc.get('latitude')}&filter_user_longitude={loc.get('longitude')}")
+    services = {}
+    for row in get_rows(jwt, path, "listing streaming services"):
+        sid, name = str(row.get("content_id") or "").strip(), " ".join(str(row.get("name") or "").split())
+        code = str(row.get("countrycode") or "").strip().upper()
+        if sid.isdigit() and name and len(code) == 2 and code.isalpha():
+            services.setdefault(sid, {"id": sid, "name": name, "country": code})
+    return sorted(services.values(), key=lambda v: (v["country"], v["name"].lower()))
+
+
+def find_service(services, wanted, country=None):
+    """The service named `wanted` (any case), else the only one whose name contains it."""
+    pool = [v for v in services if not country or v["country"] == country]
+    w = wanted.lower()
+    exact = [v for v in pool if v["name"].lower() == w or v["id"] == wanted]
+    found = exact or [v for v in pool if w in v["name"].lower()]
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        raise CgError(f"no streaming service matches {wanted!r}" + (f" in {country}" if country else "")
+                      + ": see 'cyberghost-wg services'")
+    names = ", ".join(f"{v['name']} ({v['country']})" for v in found[:8]) + (", ..." if len(found) > 8 else "")
+    raise CgError(f"{wanted!r} matches several services: {names}; give the full name or --country")
+
+
+def gaming_groups(jwt):
+    """{country: group hostname} of CyberGhost's gaming servers."""
+    groups = {}
+    for row in get_rows(jwt, f"/my/servers/filters/{FILTER_GROUPS}?filter_protocol=wireguard", "listing server groups"):
+        code, url = str(row.get("countrycode") or "").strip().upper(), str(row.get("url") or "").strip()
+        if "gaming" in str(row.get("name") or "").lower() and GROUP_URL_RE.fullmatch(url) and str(
+                row.get("available", "1")) != "0" and len(code) == 2:
+            groups[code] = url
+    return groups
+
+
+def group_addresses(host):
+    """Every IPv4 address a group hostname gives; it may give a different subset at each query."""
+    found = set()
+    for _ in range(5):
+        try:
+            found |= {info[4][0] for info in socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_STREAM)}
+        except socket.gaierror as e:
+            raise CgError(f"cannot resolve {host}: {e}")
+    return found
+
+
+def list_instances(jwt, country, kind, city=None, acc=None, service=None):
+    """The servers of a country (or of a streaming service: its id), least loaded first."""
+    acc = acc or get_account(jwt)
+    plan_id = acc["plan_id"]
+    cc = urllib.parse.quote(country or "")
+    if kind == "streaming":
+        loc = acc.get("location") or {}
+        path = (f"/my/servers/filters/{FILTER_STREAMING}?filter_protocol=wireguard"
+                f"&filter_content_id={urllib.parse.quote(str(service))}"
+                f"&filter_user_plans_id={plan_id}&filter_user_id={acc.get('id')}"
+                f"&filter_user_latitude={loc.get('latitude')}&filter_user_longitude={loc.get('longitude')}")
+    elif kind == "nospy":
+        path = f"/my/servers/filters/{FILTER_NOSPY}?filter_protocol=wireguard"
+    elif kind == "torrent":
+        path = (f"/my/servers/filters/{FILTER_TORRENT}?filter_protocol=wireguard"
+                f"&filter_country={cc}&filter_user_plans_id={plan_id}")
+    else:  # all, and gaming: the gaming servers are among all the servers of the country
+        loc = acc.get("location") or {}
+        path = (f"/my/servers/filters/{FILTER_TRAFFIC}?filter_protocol=wireguard"
+                f"&filter_country={cc}&filter_user_id={acc.get('id')}"
+                f"&filter_user_latitude={loc.get('latitude')}&filter_user_longitude={loc.get('longitude')}")
+    addresses = None
+    if kind == "gaming":
+        group = gaming_groups(jwt).get(country)
+        if not group:
+            return []
+        addresses = group_addresses(group)
+    found = []
+    for row in get_rows(jwt, path, "listing servers"):
+        if addresses is not None and str(row.get("ip") or "") not in addresses:
+            continue
+        if "0" in (str(row.get("Online", row.get("online", ""))), str(row.get("enabled", ""))):
+            continue  # marked offline or disabled
+        name = str(row.get("displayName") or row.get("name") or "").strip().lower()
+        for prefix in NAME_PREFIXES:
+            if name.startswith(prefix):
+                name = name[len(prefix):].strip()
+                break
+        # The name becomes a hostname and a line of the configuration: nothing unexpected gets through.
+        if not INSTANCE_RE.fullmatch(name):
+            continue
+        row_city = str(row.get("city") or "").strip().lower() or name.split("-")[0]
+        if city and row_city != city.strip().lower():
+            continue
+        try:
+            load = round(int(row.get("totalusers", row.get("total_users")))
+                         / int(row.get("Max_Users", row.get("max_users"))) * 100)
+        except (TypeError, ValueError, ZeroDivisionError):
+            load = 100
+        full = str(row.get("full", "0")).strip() == "1"
+        found.append((full, load, name, {"instance": name, "city": row_city, "load": load}))
+    found.sort(key=lambda f: f[:3])  # full servers last, then least loaded first
+    return [f[3] for f in found]
+
+
+# --- WireGuard ---------------------------------------------------------------
+
+P25519 = 2 ** 255 - 19
+
+
+def x25519(scalar, u):
+    """X25519 scalar multiplication (RFC 7748, section 5), on 32-byte little-endian values.
+
+    Not constant time, which does not matter here: it runs once, locally, on a key that only
+    this process has seen, to derive the public key.
+    """
+    k = bytearray(scalar)
+    k[0] &= 248
+    k[31] = (k[31] & 127) | 64
+    k = int.from_bytes(k, "little")
+    x1 = int.from_bytes(u, "little") & ((1 << 255) - 1)
+    x2, z2, x3, z3, swap = 1, 0, x1, 1, 0
+    for t in reversed(range(255)):
+        bit = (k >> t) & 1
+        if swap ^ bit:
+            x2, x3, z2, z3 = x3, x2, z3, z2
+        swap = bit
+        a, b, c, d = x2 + z2, x2 - z2, x3 + z3, x3 - z3
+        aa, bb, da, cb = a * a % P25519, b * b % P25519, d * a % P25519, c * b % P25519
+        e = aa - bb
+        x3, z3 = (da + cb) ** 2 % P25519, x1 * (da - cb) ** 2 % P25519
+        x2, z2 = aa * bb % P25519, e * (aa + 121665 * e) % P25519
+    if swap:
+        x2, z2 = x3, z3
+    return (x2 * pow(z2, P25519 - 2, P25519) % P25519).to_bytes(32, "little")
+
+
+def x25519_public(private):
+    """X25519 public key of a raw 32-byte private key, like `wg pubkey`."""
+    return x25519(private, (9).to_bytes(32, "little"))
+
+
+def generate_keypair():
+    private = bytearray(secrets.token_bytes(32))
+    private[0] &= 248  # clamped like `wg genkey`
+    private[31] = (private[31] & 127) | 64
+    private = bytes(private)
+    return base64.b64encode(private).decode(), base64.b64encode(x25519_public(private)).decode()
+
+
+def addkey_context():
+    ctx = ssl.create_default_context(cadata=CG_WG_CA)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_REQUIRED
+    # Python 3.13+ enables X509_STRICT by default, which this 2017 CA fails
+    # (non-critical basicConstraints). The official client does not enable it.
+    if hasattr(ssl, "VERIFY_X509_STRICT"):
+        ctx.verify_flags &= ~ssl.VERIFY_X509_STRICT
+    return ctx
+
+
+def check_node_cert(cert, instance):
+    """Check the server certificate names the rack of this instance.
+
+    The certificate only chains to the CyberGhost CA, which any of its servers holds a certificate
+    from; the name narrows that to the right rack (the official client checks no name at all).
+    """
+    names = [v for rdn in (cert or {}).get("subject", ()) for k, v in rdn if k == "commonName"]
+    names += [v for k, v in (cert or {}).get("subjectAltName", ()) if k == "DNS"]
+    m = re.fullmatch(r"([a-z0-9]+)-s(\d+)-i\d+", instance)
+    expected = f"{m.group(1)}-rack{m.group(2)}{NODE_CERT_SUFFIX}" if m else None
+    for name in names:
+        name = name.lower()
+        if name == expected if expected else name.endswith(NODE_CERT_SUFFIX):
+            return
+    raise CgError(f"certificate issued to {', '.join(names) or 'no name'}, "
+                  f"expected {expected or '*' + NODE_CERT_SUFFIX}")
+
+
+def add_key(host, device, public_key):
+    query = urllib.parse.urlencode({"pubkey": public_key})
+    basic = base64.b64encode(f"{device['token']}:{device['secret']}".encode()).decode()
+    conn = http.client.HTTPSConnection(host, ADDKEY_PORT, timeout=TIMEOUT, context=addkey_context())
+    try:
+        conn.connect()
+        try:
+            check_node_cert(conn.sock.getpeercert(), host.split(".")[0])
+        except CgError as e:  # before the device credentials are sent
+            raise CgError(f"{host}: {e}")
+        conn.request("GET", f"/addKey?{query}", headers={"Authorization": "Basic " + basic,
+                                                         "User-Agent": USER_AGENT})
+        resp = conn.getresponse()
+        code, raw = resp.status, resp.read()
+    except (http.client.HTTPException, OSError) as e:
+        raise CgError(f"{host} unreachable: {e}")
+    finally:
+        conn.close()
+    debug(f"GET {host}:{ADDKEY_PORT}/addKey: HTTP {code}")
+    if code in (401, 403):
+        raise DeviceRefused(f"{host} refused the device (HTTP {code})")
+    if code != 200:
+        raise CgError(f"{host} refused the key: HTTP {code}")
+    try:
+        r = json.loads(raw)
+    except ValueError:
+        raise CgError(f"unreadable addKey answer from {host}")
+    if not isinstance(r, dict) or str(r.get("status", "")).strip() != "OK":
+        raise CgError(f"addKey failed on {host}: status {r.get('status') if isinstance(r, dict) else '?'}")
+    return r
+
+
+def parse_addkey(r):
+    """Strictly validate the answer: nothing is copied into the config unchecked."""
+    try:
+        peer_ip = str(r["peer_ip"]).strip()
+        iface = ipaddress.ip_interface(peer_ip)
+        if iface.version != 4:
+            raise ValueError
+        if "/" not in peer_ip:
+            iface = ipaddress.ip_interface(f"{iface.ip}/32")
+        server_key = str(r["server_key"]).strip()
+        if len(base64.b64decode(server_key, validate=True)) != 32:
+            raise ValueError
+        port = int(r["server_port"])
+        if not 0 < port < 65536:
+            raise ValueError
+    except (KeyError, TypeError, ValueError):
+        raise CgError("incomplete or invalid addKey answer")
+    dns = r.get("dns_servers")
+    if isinstance(dns, str):
+        dns = dns.replace(",", " ").split()
+    try:
+        dns = [str(ipaddress.ip_address(str(d).strip())) for d in (dns or []) if str(d).strip()]
+    except ValueError:
+        raise CgError("invalid DNS servers in the addKey answer")
+    return {"address": str(iface), "server_key": server_key, "port": port, "dns": dns or [DEFAULT_DNS]}
+
+
+def resolve_ipv4(host):
+    try:
+        infos = socket.getaddrinfo(host, None, socket.AF_INET, socket.SOCK_DGRAM)
+    except socket.gaierror as e:
+        raise CgError(f"cannot resolve {host}: {e}")
+    return infos[0][4][0]
+
+
+def parse_allowed_ips(value):
+    """Comma-separated networks, normalized; anything else is refused."""
+    try:
+        nets = [str(ipaddress.ip_network(n.strip(), strict=False)) for n in value.split(",") if n.strip()]
+    except ValueError as e:
+        raise CgError(f"invalid --allowed-ips: {e}")
+    if not nets:
+        raise CgError("--allowed-ips is empty")
+    return ", ".join(nets)
+
+
+def render_conf(meta, private_key, peer, endpoint, allowed_ips=DEFAULT_ALLOWED_IPS, dns=True):
+    return (f"# CyberGhost {meta}, generated {time.strftime('%Y-%m-%d %H:%M:%S %z')}\n"
+            "[Interface]\n"
+            f"PrivateKey = {private_key}\n"
+            f"Address = {peer['address']}\n"
+            + (f"DNS = {', '.join(peer['dns'])}\n" if dns else "")
+            + "\n[Peer]\n"
+            f"PublicKey = {peer['server_key']}\n"
+            f"AllowedIPs = {allowed_ips}\n"
+            f"Endpoint = {endpoint}:{peer['port']}\n")
+
+
+def stdout_is_journal():
+    """True when stdout goes to the systemd journal (JOURNAL_STREAM=<device>:<inode>)."""
+    try:
+        dev, ino = (int(x) for x in os.environ["JOURNAL_STREAM"].split(":"))
+        st = os.fstat(sys.stdout.fileno())
+    except (KeyError, ValueError, OSError, AttributeError):
+        return False
+    return (st.st_dev, st.st_ino) == (dev, ino)
+
+
+# --- Interactive choices -----------------------------------------------------
+
+def choose(title, labels, default=0):
+    """Numbered menu on stderr; returns the index of the chosen label."""
+    log(f"\n{title}")
+    for i, label in enumerate(labels, 1):
+        log(f"  {i:>2}) {label}")
+    while True:
+        answer = ask(f"Choice [{default + 1}]: ")
+        if not answer:
+            return default
+        if answer.isdigit() and 1 <= int(answer) <= len(labels):
+            return int(answer) - 1
+        log(f"  Type a number from 1 to {len(labels)}.")
+
+
+def choose_country(countries, default_code):
+    log("\nCountry")
+    cells = [f"{i:>3}) {c['code']} {c['name']}"[:30] for i, c in enumerate(countries, 1)]
+    for start in range(0, len(cells), 3):
+        log("".join(f"{cell:<32}" for cell in cells[start:start + 3]).rstrip())
+    codes = [c["code"] for c in countries]
+    hint = f" [{default_code}]" if default_code in codes else ""
+    while True:
+        answer = ask(f"Number or country code{hint}: ").upper()
+        if not answer and hint:
+            return default_code
+        if answer in codes:
+            return answer
+        if answer.isdigit() and 1 <= int(answer) <= len(codes):
+            return codes[int(answer) - 1]
+        log("  Type a number or a 2-letter code from the list.")
+
+
+def confirm(question, default):
+    answer = ask(f"{question} [{'Y/n' if default else 'y/N'}]: ").lower()
+    return default if not answer else answer in ("y", "yes")
+
+
+def interactive_choices(state, args):
+    """Ask for whatever the command line left open: type, country, city, server, output."""
+    if not (sys.stdin.isatty() and sys.stderr.isatty()):
+        raise CgError("--interactive needs a terminal")
+    log(f"Note: {KEY_WARNING}")
+    jwt, acc = session(state, args)
+
+    kind = args.type or ("streaming" if args.service else None)
+    if not kind:
+        kind = SERVER_TYPES[choose("Server type", [TYPE_LABELS[t] for t in SERVER_TYPES],
+                                   SERVER_TYPES.index(server_type(args)))]
+    country = need_country(args) if args.country else None
+    service = None
+    if kind == "streaming":
+        services = list_services(jwt, acc)
+        if args.service:
+            service = find_service(services, args.service, country)
+        else:
+            if not country:
+                country = choose_country(list_countries(jwt, kind, acc),
+                                         (os.environ.get("CG_COUNTRY") or "").upper())
+            pool = [v for v in services if v["country"] == country]
+            if not pool:
+                raise CgError(f"no streaming service in {country}")
+            service = pool[0] if len(pool) == 1 else pool[choose("Streaming service", [v["name"] for v in pool])]
+    elif kind == "nospy":
+        country = NOSPY_COUNTRY
+    elif not country:
+        countries = list_countries(jwt, kind, acc)
+        if not countries:
+            raise CgError(f"no country offers {kind} servers")
+        country = choose_country(countries, (os.environ.get("CG_COUNTRY") or "").upper())
+
+    instances = list_instances(jwt, country, kind, args.city, acc, service and service["id"])
+    if not instances:
+        raise CgError("no server matches")
+    cities = {}
+    for inst in instances:  # least loaded first, so each city's first server is its best
+        cities.setdefault(inst["city"], []).append(inst)
+    if not args.city and len(cities) > 1:
+        names = list(cities)
+        pick = choose("City", ["any (least loaded server)"] + [
+            f"{name} ({len(cities[name])} servers, from {cities[name][0]['load']}% load)" for name in names])
+        if pick:
+            instances = cities[names[pick - 1]]
+    shown = instances[:10]
+    title = "Server" + (f" (the 10 least loaded of {len(instances)})" if len(instances) > 10 else "")
+    pick = choose(title, ["automatic: least loaded, the next ones if it refuses"] + [
+        f"{i['instance']} ({i['city']}, load {i['load']}%)" for i in shown])
+    candidates = instances[:args.tries] if pick == 0 else [shown[pick - 1]]
+
+    output = args.output
+    if output is None:
+        log("")
+        output = ask("Write the configuration to [cyberghost.conf] ('-' prints it): ") or "cyberghost.conf"
+    if output != "-" and os.path.exists(output) and not confirm(f"{output} exists, replace it?", False):
+        raise CgError("cancelled")
+    log(f"\n{KEY_WARNING}")
+    if not confirm("Generate it now?", True):
+        raise CgError("cancelled")
+    return candidates, f"streaming {service['name']}" if service else kind, output
+
+
+# --- Commands ----------------------------------------------------------------
+
+def default_device_name():
+    return f"cyberghost-wg-{socket.gethostname()}"
+
+
+def device_on_account(jwt, device):
+    """False only when the account's device list is readable and this device is not in it."""
+    code, devices = api("GET", "/my/devices", jwt)
+    if code != 200 or not isinstance(devices, list):
+        return True
+    return any(isinstance(d, dict) and str(d.get("id")) == str(device.get("id")) for d in devices)
+
+
+def cmd_login(args):
+    if args.remember and not can_remember():  # before anything is created
+        raise CgError(f"cannot remember the credentials: {remember_unavailable()}")
+    # Remembered credentials are never used here: login is where they get replaced.
+    username, password = get_credentials(args)
+    state = load_state(args.state)
+    state["jwt"] = request_jwt(username, password)
+    state.pop("account", None)  # cached with the session, maybe of another account
+    save_state(args.state, state)
+    old = state.get("device") or {}
+    if old.get("token") and not device_on_account(state["jwt"], old):
+        log(f"The device {old.get('name')} is no longer on the account, registering a new one.")
+        state.pop("device")
+    if (state.get("device") or {}).get("token"):
+        log(f"Signed in. Keeping the existing device: {state['device'].get('name')}")
+    else:
+        name = args.name
+        if not name:
+            name = old.get("name") or default_device_name()
+            if sys.stdin.isatty() and not args.password_stdin:
+                name = ask(f"Device name, as shown in your CyberGhost account [{name}]: ") or name
+        code, d = api("POST", "/my/devices", state["jwt"], {"linuxApp": True, "machineName": name})
+        if code != 201 or not isinstance(d, dict) or not d.get("token") or not d.get("tokenSecret"):
+            raise api_error("device creation refused", code, d)
+        state["device"] = {"id": d.get("id"), "name": d.get("name") or name,
+                           "token": d["token"], "secret": d["tokenSecret"]}
+        save_state(args.state, state)
+        log(f"Signed in. Device created: {state['device']['name']} (id {state['device']['id']})")
+    exp = jwt_expiry(state["jwt"])
+    log(f"Session valid until {time.strftime('%Y-%m-%d %H:%M', time.localtime(exp)) if exp else '?'}")
+    log(f"State saved to {args.state} (mode 0600)")
+
+    keep = args.remember
+    if keep is None and sys.stdin.isatty() and not args.password_stdin:
+        if can_remember():
+            keep = confirm("Remember the credentials, encrypted with systemd-creds, "
+                           "so they are not asked again until logout?", True)
+        else:
+            log(f"{remember_unavailable()}: the credentials will be asked again when the session expires.")
+    if keep:
+        remember(args.state, username, password)
+        log(f"Credentials remembered, encrypted: {remembered_path(args.state, 'password')} "
+            "and cg-username.cred next to it")
+    elif keep is False and forget(args.state):
+        log("Previously remembered credentials removed.")
+
+
+def print_json(data):
+    print(json.dumps(data, indent=2, ensure_ascii=False))
+
+
+def cmd_countries(args):
+    state = load_state(args.state)
+    jwt, acc = session(state, args)
+    countries = list_countries(jwt, server_type(args), acc)
+    if not countries:
+        raise CgError("no country found")
+    if args.json:
+        return print_json(countries)
+    print(f"{'CODE':<6}COUNTRY")
+    for c in countries:
+        print(f"{c['code']:<6}{c['name']}".rstrip())
+
+
+def servers_of(state, args):
+    """(servers least loaded first, label) for the type, country or service asked for."""
+    kind = server_type(args)
+    if kind == "streaming":
+        wanted = need_service(args)
+        country = need_country(args) if args.country else None
+        jwt, acc = session(state, args)
+        service = find_service(list_services(jwt, acc), wanted, country)
+        return list_instances(jwt, None, kind, args.city, acc, service["id"]), f"streaming {service['name']}"
+    country = NOSPY_COUNTRY if kind == "nospy" else need_country(args)
+    jwt, acc = session(state, args)
+    return list_instances(jwt, country, kind, args.city, acc), kind
+
+
+def no_server(args):
+    kind = server_type(args)
+    if kind in ("streaming", "nospy"):
+        return CgError("no server matches")
+    return CgError(f"no {kind} server matches" + (f" in {need_country(args)}" if kind != "all" else "")
+                   + f": see 'cyberghost-wg countries --type {kind}'")
+
+
+def cmd_services(args):
+    state = load_state(args.state)
+    country = need_country(args) if args.country else None
+    services = [v for v in list_services(*session(state, args)) if not country or v["country"] == country]
+    if not services:
+        raise CgError("no streaming service found")
+    if args.json:
+        return print_json(services)
+    print(f"{'CODE':<6}SERVICE")
+    for v in services:
+        print(f"{v['country']:<6}{v['name']}")
+
+
+def cmd_servers(args):
+    instances = servers_of(load_state(args.state), args)[0]
+    if not instances:
+        raise no_server(args)
+    if args.json:
+        return print_json(instances)
+    print(f"{'INSTANCE':<28}{'LOAD':<6}CITY")
+    for i in instances:
+        print(f"{i['instance']:<28}{str(i['load']) + '%':<6}{i['city']}")
+
+
+def cmd_conf(args):
+    allowed_ips = parse_allowed_ips(args.allowed_ips)
+    if (args.output or "-") == "-" and not args.interactive and stdout_is_journal():
+        raise CgError("stdout goes to the systemd journal, which would keep the private key: use -o FILE")
+    state = load_state(args.state)
+    device = need_device(state)
+    kind, output = server_type(args), args.output or "-"
+    if args.interactive:
+        candidates, kind, output = interactive_choices(state, args)
+    elif args.instance:
+        candidates = [{"instance": args.instance.lower(), "load": None}]
+    else:
+        candidates, kind = servers_of(state, args)
+        if not candidates:
+            raise no_server(args)
+        candidates = candidates[:args.tries]
+    refused = 0
+    for cand in candidates:
+        host = f"{cand['instance']}.cg-dialup.net"
+        try:
+            private_key, public_key = generate_keypair()
+            peer = parse_addkey(add_key(host, device, public_key))
+            endpoint = host if args.keep_hostname else resolve_ipv4(host)
+        except CgError as e:
+            refused += isinstance(e, DeviceRefused)
+            log(f"{cand['instance']}: {e}")
+            continue
+        meta = cand["instance"] if cand["load"] is None else f"{cand['instance']} ({kind}, load {cand['load']}%)"
+        conf = render_conf(meta, private_key, peer, endpoint, allowed_ips, not args.no_dns)
+        if output == "-":
+            sys.stdout.write(conf)
+            sys.stdout.flush()
+        else:
+            write_secret_file(output, conf)
+        deadline = time.strftime("%H:%M", time.localtime(time.time() + KEY_DEADLINE))
+        log(f"OK: {meta}, address {peer['address']}, endpoint {endpoint}:{peer['port']}")
+        if output != "-":
+            log(f"Written to {output} (mode 0600).")
+        log(f"Bring the tunnel up before {deadline}, or CyberGhost drops the key.")
+        return
+    if refused == len(candidates):
+        raise CgError(f"{'the server' if refused == 1 else 'every server'} refused the device: if it was removed "
+                      "from the account, 'cyberghost-wg login' registers a new one")
+    raise CgError(f"no server accepted a key ({len(candidates)} tried)")
+
+
+def cmd_logout(args):
+    state = load_state(args.state)
+    device = state.get("device")
+    if not device:
+        log("No device registered.")
+    elif args.local:
+        log(f"Device {device.get('name')} left on the account: remove it from your CyberGhost account.")
+    else:
+        code, r = api("DELETE", f"/my/devices/{urllib.parse.quote(str(device.get('id')))}",
+                      ensure_jwt(state, args))
+        if code == 404:
+            log(f"Device {device.get('name')} was already gone.")
+        elif not 200 <= code < 300:
+            raise api_error("device deletion refused (--local removes only the local files)", code, r)
+        else:
+            log(f"Device {device.get('name')} deleted from the account.")
+        log("Tunnels already up keep working until they stop: CyberGhost does not cut them.")
+    if forget(args.state):
+        log("Remembered credentials removed.")
+    if os.path.exists(args.state):
+        os.unlink(args.state)
+        log(f"State file removed: {args.state}")
+
+
+CREDENTIALS_HELP = """\
+credentials (needed by login, and later only when the session, 24 hours, has expired),
+first match wins; the password is never accepted as an argument:
+  --username USER / --password-stdin
+  CG_USERNAME, CG_PASSWORD              environment variables
+  CG_USERNAME_FILE, CG_PASSWORD_FILE    files, e.g. Docker or Podman secrets (not with the variable)
+  $CREDENTIALS_DIRECTORY/cg-username, cg-password    systemd LoadCredential=
+  remembered by 'login --remember'      encrypted with systemd-creds, not used by login
+  prompt                                when run in a terminal
+"""
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--username", help="CyberGhost username (default: see below)")
+    common.add_argument("--password-stdin", action="store_true", help="read the password from stdin")
+    common.add_argument("-v", "--verbose", action="store_true",
+                        help="show each request and its HTTP status (never secrets), for bug reports")
+
+    p = argparse.ArgumentParser(prog="cyberghost-wg", description="CyberGhost WireGuard configurations "
+                                "without the official client (unofficial).",
+                                epilog=CREDENTIALS_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--version", action="version", version=f"%(prog)s {VERSION}")
+    p.add_argument("--state", default=default_state_path(),
+                   help="state file holding the device and the session, mode 0600 "
+                        "(default: $CG_WG_STATE or ~/.config/cyberghost-wg/state.json)")
+    sub = p.add_subparsers(dest="cmd", required=True, metavar="COMMAND")
+
+    def add(name, func, hlp):
+        s = sub.add_parser(name, parents=[common], help=hlp, description=hlp,
+                           epilog=CREDENTIALS_HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
+        s.set_defaults(func=func)
+        return s
+
+    def add_type(s):
+        s.add_argument("--type", choices=SERVER_TYPES, help="server type (default: $CG_TYPE, else all; "
+                                                            "streaming with --service)")
+
+    s = add("login", cmd_login, "authenticate and register a device (once)")
+    s.add_argument("--name", help=f"device name, asked in a terminal (default: {default_device_name()})")
+    s.add_argument("--remember", dest="remember", action="store_true", default=None,
+                   help="keep the credentials, encrypted with systemd-creds, until logout (asked in a terminal)")
+    s.add_argument("--no-remember", dest="remember", action="store_false",
+                   help="do not keep them, and forget any kept before")
+
+    s = add("countries", cmd_countries, "list the countries offering WireGuard servers")
+    add_type(s)
+    s.add_argument("--json", action="store_true", help="print JSON, for scripts")
+
+    s = add("services", cmd_services, "list the streaming services that have WireGuard servers")
+    s.add_argument("--country", help="only this country, e.g. GB")
+    s.add_argument("--json", action="store_true", help="print JSON, for scripts")
+
+    for name, func, hlp in (("servers", cmd_servers, "list WireGuard servers, least loaded first"),
+                            ("conf", cmd_conf, "register a new key and write a WireGuard config")):
+        s = add(name, func, hlp)
+        s.add_argument("--country", help="2-letter country code, e.g. CH (default: $CG_COUNTRY)")
+        add_type(s)
+        s.add_argument("--service", help="streaming service, e.g. 'Netflix UK' (implies --type streaming)")
+        s.add_argument("--city", help="only this city, e.g. zurich or 'new york'")
+        if name == "servers":
+            s.add_argument("--json", action="store_true", help="print JSON, for scripts")
+    s.add_argument("-i", "--interactive", action="store_true",
+                   help="choose the type, country, city and server from menus (asks only what is not given)")
+    s.add_argument("--instance", help="use this instance, e.g. zurich-s404-i05, without listing servers")
+    s.add_argument("--tries", type=int, default=3, help="instances to try, least loaded first (default: 3)")
+    s.add_argument("--allowed-ips", default=DEFAULT_ALLOWED_IPS,
+                   help="networks sent through the tunnel, comma-separated (default: %(default)s)")
+    s.add_argument("--keep-hostname", action="store_true",
+                   help="write the hostname in Endpoint instead of its IPv4 address")
+    s.add_argument("--no-dns", action="store_true",
+                   help="leave out the DNS line (wg-quick needs resolvconf for it)")
+    s.add_argument("-o", "--output", help="output file, written with mode 0600 (default: stdout)")
+
+    s = add("logout", cmd_logout, "delete the device from the account and remove the state file")
+    s.add_argument("--local", action="store_true",
+                   help="only remove the local files, e.g. when the API is unreachable or the account closed")
+    return p
+
+
+def main(argv=None):
+    global VERBOSE
+    p = build_parser()
+    args = p.parse_args(argv)
+    VERBOSE = args.verbose
+    if getattr(args, "tries", 1) < 1:
+        p.error("--tries must be at least 1")
+    if getattr(args, "service", None) and args.type not in (None, "streaming"):
+        p.error("--service is for streaming servers, not --type " + args.type)
+    if hasattr(args, "type") and server_type(args) not in SERVER_TYPES:
+        p.error(f"invalid server type {server_type(args)!r} (choose from {', '.join(SERVER_TYPES)})")
+    if getattr(args, "interactive", False) and args.instance:
+        p.error("--interactive and --instance cannot be used together")
+    if getattr(args, "instance", None) and not INSTANCE_RE.fullmatch(args.instance.lower()):
+        p.error(f"invalid --instance {args.instance!r}: a server name such as zurich-s404-i06")
+    try:
+        args.func(args)
+    except CgError as e:
+        log(f"cyberghost-wg: error: {e}")
+        return 1
+    except KeyboardInterrupt:
+        log("")
+        return 130
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

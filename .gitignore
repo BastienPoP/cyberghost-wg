@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+# generated configurations and local state hold secrets
+*.conf
+state.json
+*.cred
