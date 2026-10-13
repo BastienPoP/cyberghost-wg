@@ -13,4 +13,4 @@ about: Something does not work as described
 - `cyberghost-wg --version`:
 - `python3 --version`:
 - Distribution and architecture:
-- Used with (gluetun, wg-quick, other):
+- Used with (the gluetun image, gluetun's custom provider, other):

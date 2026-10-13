@@ -1,0 +1,42 @@
+# gluetun with a fresh CyberGhost WireGuard configuration on every start, as a
+# rootless Podman Quadlet: copy to ~/.config/containers/systemd/ (see README.md).
+# Needs ~/.config/gluetun-cyberghost/vpn.env, its state/ folder and the Podman
+# secrets cg_username and cg_password.
+[Unit]
+Description=gluetun (CyberGhost WireGuard)
+StartLimitIntervalSec=0
+
+[Container]
+ContainerName=gluetun
+Image=ghcr.io/bastienpop/gluetun-cyberghost:latest
+AddCapability=NET_ADMIN
+AddDevice=/dev/net/tun
+# CyberGhost has no IPv6. Rootless Podman gives the container the host's IPv6:
+# clients would try it first and wait for gluetun's firewall to block it.
+Sysctl=net.ipv6.conf.all.disable_ipv6=1
+EnvironmentFile=%h/.config/gluetun-cyberghost/vpn.env
+Environment=CG_USERNAME_FILE=/run/secrets/cg_username CG_PASSWORD_FILE=/run/secrets/cg_password
+Secret=cg_username
+Secret=cg_password
+Volume=%h/.config/gluetun-cyberghost/state:/cyberghost-wg
+# Podman does not read the health check of the image: it is set here.
+HealthCmd=/gluetun-entrypoint healthcheck
+HealthInterval=10s
+HealthTimeout=5s
+HealthRetries=3
+HealthStartPeriod=60s
+# A tunnel that stays down gets the container killed, and systemd starts it
+# again: with a fresh key.
+HealthOnFailure=kill
+# The service only counts as started once the tunnel is up: units that use its
+# network (Network=gluetun.container) wait until then.
+Notify=healthy
+
+[Service]
+Restart=always
+# Gives the network time to come back, and the API time to lift its rate limit.
+RestartSec=30
+TimeoutStartSec=180
+
+[Install]
+WantedBy=default.target

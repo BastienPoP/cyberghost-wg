@@ -1,0 +1,53 @@
+name: image
+
+# Builds the gluetun image (gluetun/Dockerfile) and pushes it to
+# ghcr.io/bastienpop/gluetun-cyberghost:
+# - on a release tag such as v0.2.0: as 0.2.0 and latest;
+# - by hand (Actions > image > Run workflow): as latest, e.g. after a gluetun
+#   update that needs no new release of the script.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  IMAGE: ghcr.io/bastienpop/gluetun-cyberghost
+
+jobs:
+  image:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      - name: Smoke test (amd64)
+        run: |
+          docker buildx build --load -f gluetun/Dockerfile -t smoke .
+          docker run --rm --entrypoint cyberghost-wg smoke --version
+          docker run --rm --entrypoint sh smoke -c 'test -x /cyberghost-entrypoint.sh && test -x /gluetun-entrypoint'
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest
+          labels: |
+            org.opencontainers.image.title=gluetun-cyberghost
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: gluetun/Dockerfile
+          platforms: linux/amd64,linux/arm64,linux/arm/v7
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}

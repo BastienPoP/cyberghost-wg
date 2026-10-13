@@ -1,0 +1,54 @@
+# gluetun with a fresh CyberGhost WireGuard configuration on every start.
+# Needs, next to this file: vpn.env, secrets/cg_username, secrets/cg_password
+# and the state/ folder (see README.md).
+services:
+  gluetun:
+    image: ghcr.io/bastienpop/gluetun-cyberghost:latest
+    # Used by `docker compose build`, or when the image cannot be pulled.
+    build:
+      context: ..
+      dockerfile: gluetun/Dockerfile
+    container_name: gluetun
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    # CyberGhost has no IPv6: without it in the container, clients never try
+    # IPv6 first and wait for the firewall to block it.
+    sysctls:
+      - net.ipv6.conf.all.disable_ipv6=1
+    env_file: vpn.env
+    environment:
+      CG_USERNAME_FILE: /run/secrets/cg_username
+      CG_PASSWORD_FILE: /run/secrets/cg_password
+    secrets:
+      - cg_username
+      - cg_password
+    volumes:
+      - ./state:/cyberghost-wg
+    # gluetun's own health check, with more time for cyberghost-wg at start;
+    # images built with Podman (OCI format) would lose it without this.
+    healthcheck:
+      test: ["CMD", "/gluetun-entrypoint", "healthcheck"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+    restart: unless-stopped
+
+  # A container that only goes out through the tunnel: replace it with yours.
+  # Its ports are published on the gluetun service.
+  # my-app:
+  #   image: ...
+  #   network_mode: "service:gluetun"
+  #   depends_on:
+  #     gluetun:
+  #       condition: service_healthy
+  #       restart: true
+  #   restart: unless-stopped
+
+secrets:
+  cg_username:
+    file: ./secrets/cg_username
+  cg_password:
+    file: ./secrets/cg_password

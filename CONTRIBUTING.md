@@ -21,6 +21,10 @@ issues go through [SECURITY.md](SECURITY.md), not public issues.
   `write_secret_file` (atomic, mode `0600`).
 - **stdout is for output only.** Prompts, progress and errors go to stderr, so
   that `conf` without `-o` and `--json` stay usable in pipes.
+- **The gluetun image stays thin.** `gluetun/` only adds the script and a
+  short entrypoint to the gluetun image; anything a user of the bare script
+  could use belongs in the script. The image copies the script from the
+  repository, so both always match.
 - **English** everywhere: code, comments, docs, commit messages.
 - The README documents every user-visible option and behaviour; update it in
   the same change, and add a line to `CHANGELOG.md` under an `Unreleased`
@@ -56,21 +60,21 @@ export CG_WG_STATE=/tmp/cg-dev/state.json
   bringing the tunnel up.
 - **Bring tunnels up in a container**, not on your machine: a full tunnel
   replaces the default route, and on a remote machine it cuts your SSH session.
-  A rootless container has its own network namespace:
+  The gluetun image built from the working tree does it with a throwaway state:
 
   ```bash
-  podman run --rm -it --cap-add NET_ADMIN --device /dev/net/tun \
-    --sysctl net.ipv4.conf.all.src_valid_mark=1 \
-    -v ./wg0.conf:/etc/wireguard/wg0.conf:ro,Z debian:trixie-slim bash
-  # inside: apt-get update && apt-get install -y wireguard-tools iproute2 nftables curl
-  #         printf '#!/bin/sh\nexit 0\n' > /usr/local/bin/sysctl && chmod +x /usr/local/bin/sysctl
-  #         wg-quick up wg0 && curl -4 https://ipinfo.io/ip
+  podman build -f gluetun/Dockerfile -t cyberghost-wg-dev .
+  mkdir -m 700 /tmp/cg-dev
+  podman run --rm -it --name cg-dev --cap-add NET_ADMIN --device /dev/net/tun \
+    --sysctl net.ipv6.conf.all.disable_ipv6=1 -e CG_COUNTRY=CH -e CG_TYPE=torrent \
+    -v /tmp/cg-dev:/cyberghost-wg cyberghost-wg-dev   # the account owner types the password
+  # in another terminal:
+  podman run --rm --network container:cg-dev alpine:3 wget -qO- https://ipinfo.io/ip
+  podman exec cg-dev cyberghost-wg logout
   ```
 
-  `/proc/sys` is read-only in a rootless container, so `wg-quick`'s own
-  `sysctl` call fails even though `--sysctl` already set the value: the no-op
-  `sysctl` above is a test-only workaround. gluetun's custom provider is the
-  other easy way to test a configuration.
+  Without `CG_USERNAME_FILE`, the first-start `login` asks for the credentials
+  in the terminal (`-it`).
 
 ## What is known about the API
 
@@ -142,4 +146,12 @@ New findings belong in this section, with the date they were observed.
 
 The `release` workflow runs the tests again, checks that the tag matches
 `VERSION`, and publishes the release with the script, `SHA256SUMS` and the
-CHANGELOG section as notes.
+CHANGELOG section as notes. The `image` workflow builds the gluetun image for
+amd64, arm64 and armv7 and pushes it to `ghcr.io/bastienpop/gluetun-cyberghost`
+as `X.Y.Z` and `latest`.
+
+**gluetun updates** need no release: Dependabot opens a pull request when a new
+gluetun image is out; after merging it, run the `image` workflow by hand
+(Actions → image → Run workflow), which republishes `latest`. Try the new
+gluetun first: its settings and log lines are documented in
+`gluetun/README.md`.

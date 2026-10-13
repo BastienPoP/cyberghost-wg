@@ -1,0 +1,12 @@
+# Weekly pull requests for a new gluetun base image and new action versions.
+# After merging a gluetun update, run the image workflow by hand to publish it.
+version: 2
+updates:
+  - package-ecosystem: docker
+    directory: /gluetun
+    schedule:
+      interval: weekly
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

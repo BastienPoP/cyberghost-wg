@@ -4,3 +4,7 @@ __pycache__/
 *.conf
 state.json
 *.cred
+# the gluetun folder's local settings, state and credentials
+gluetun/vpn.env
+gluetun/state/
+gluetun/secrets/

@@ -8,10 +8,14 @@ CyberGhost only hands out WireGuard configurations through its own apps. Its
 Linux client is an x86-64 binary that needs root and brings the tunnel up itself,
 and [gluetun](https://github.com/qdm12/gluetun)'s built-in CyberGhost provider
 only speaks OpenVPN. `cyberghost-wg` is a single Python script that makes the
-same API calls as the official client and writes a standard `wg-quick`
-configuration instead, which you can feed to gluetun (custom provider),
-`wg-quick`, or anything else that speaks WireGuard. It runs
-unprivileged, on any architecture, with nothing but Python.
+same API calls as the official client and writes a standard WireGuard
+configuration instead, which you can feed to gluetun (custom provider) or
+anything else that speaks WireGuard. It runs unprivileged, on any
+architecture, with nothing but Python.
+
+**Using gluetun?** The [gluetun-cyberghost image](gluetun/README.md) has
+`cyberghost-wg` built in and generates a fresh configuration every time the
+container starts: with Docker Compose or Podman, nothing to install.
 
 > [!WARNING]
 > **Unofficial.** This project is not affiliated with, endorsed by or supported
@@ -30,8 +34,8 @@ unprivileged, on any architecture, with nothing but Python.
 | An active CyberGhost subscription | – |
 | Optional: `systemd-creds` from systemd 256 or later (250 as root), only to remember the credentials encrypted | `systemd-creds --version` |
 
-Tested on Linux (Debian 13, arm64) with Python 3.8 and 3.13, with gluetun and
-wg-quick; the test suite runs on Python 3.8 to 3.14. Nothing
+Tested on Linux (Debian 13, arm64) with Python 3.8 and 3.13, with gluetun; the
+test suite runs on Python 3.8 to 3.14. Nothing
 in it is Linux-specific except remembering the credentials, but macOS, the BSDs
 and Windows are untested: reports are welcome.
 
@@ -140,16 +144,16 @@ up to it.
 | `--tries N` | `3` | Servers to try, least loaded first, if one refuses the key |
 | `--instance NAME` | – | Use this server (e.g. `zurich-s404-i06`) without listing servers |
 | `--allowed-ips LIST` | `0.0.0.0/0, ::/0` | Networks sent through the tunnel (see below) |
-| `--no-dns` | – | Leaves out the `DNS` line (see [wg-quick](#use-with-wg-quick)) |
+| `--no-dns` | – | Leaves out the `DNS` line, for clients that handle DNS themselves |
 | `--keep-hostname` | – | Writes the server hostname in `Endpoint` instead of its IPv4 address |
 
 `Endpoint` is an IPv4 address by default because some clients, gluetun among
 them, need one.
 
-`AllowedIPs` tells WireGuard which destinations go through the tunnel; with
-`wg-quick` it also sets the routes. The default sends everything. It includes
-`::/0` although CyberGhost has no IPv6: IPv6 traffic then goes into the tunnel
-and is dropped, instead of leaving the machine outside the VPN. Narrow it for
+`AllowedIPs` tells WireGuard which destinations go through the tunnel, and most
+clients route them there. The default sends everything. It includes `::/0`
+although CyberGhost has no IPv6: IPv6 traffic then goes into the tunnel and is
+dropped, instead of leaving the machine outside the VPN. Narrow it for
 split tunneling, e.g. `--allowed-ips 0.0.0.0/0` if you want IPv6 to bypass the
 VPN, or `--allowed-ips 203.0.113.0/24` to send only one network through it.
 gluetun ignores this line and `DNS` too: it only reads
@@ -234,7 +238,13 @@ password.
 
 ## Use with gluetun
 
-Generate the configuration just before starting gluetun, with the
+The simplest way is the **[gluetun-cyberghost image](gluetun/README.md)**:
+gluetun with `cyberghost-wg` inside, which registers the device on the first
+start and generates a fresh configuration on every start, reboots included.
+It comes with a `compose.yaml` for Docker and a Quadlet unit for Podman.
+
+With the stock gluetun image instead, generate the configuration just before
+starting it, with the
 [custom provider](https://github.com/qdm12/gluetun-wiki/blob/main/setup/providers/custom.md):
 
 ```bash
@@ -245,86 +255,26 @@ docker run -d --name gluetun --cap-add NET_ADMIN --device /dev/net/tun \
   qmcgaw/gluetun
 ```
 
-gluetun brings its own kill switch and DNS (DNS over TLS by default), so the
-`DNS` line of the configuration does not matter to it. To get a fresh key on
-every start without thinking about it, see
-[Start the tunnel with a fresh key](#start-the-tunnel-with-a-fresh-key).
-
-## Use with wg-quick
-
-```bash
-cyberghost-wg conf --country CH -o cyberghost.conf
-sudo wg-quick up ./cyberghost.conf
-```
-
-- **DNS:** `wg-quick` needs `resolvconf` to apply the `DNS` line. Without it,
-  it stops with `resolvconf: command not found` and removes the interface.
-  Install `openresolv`, which then points `/etc/resolv.conf` to CyberGhost's
-  DNS while the tunnel is up (or use systemd-resolved's `resolvconf`), or
-  generate with `--no-dns`. With `--no-dns` your usual DNS servers stay in use:
-  through the tunnel if they are on the internet, but outside it if they are on
-  your local network, such as your router's.
-- **IPv6 disabled in the kernel:** `wg-quick` stops with
-  `Error: IPv6 is disabled on nexthop device.`: generate with
-  `--allowed-ips 0.0.0.0/0`.
-- With IPv6 enabled, the default `AllowedIPs` sends IPv6 into the tunnel, where
-  it is dropped: nothing leaks outside the VPN.
-- `wg-quick` has no kill switch: if the tunnel goes down, traffic leaves
-  outside it.
-
-`wg-quick strip cyberghost.conf` gives the part `wg setconf` accepts, for setups
-that create the interface themselves.
+and do it again before every start: Docker restarts containers by itself after
+a reboot, with the old configuration, whose key is dead by then (see
+[below](#start-the-tunnel-with-a-fresh-key)). gluetun brings its own kill
+switch and DNS (DNS over TLS by default), so the `DNS` line of the
+configuration does not matter to it.
 
 ## Start the tunnel with a fresh key
 
 A key only lives a few minutes until a tunnel uses it, so generate the
-configuration each time the tunnel starts, not once at install. With systemd,
-run `cyberghost-wg conf` in `ExecStartPre=`: if it fails, the tunnel does not
-start with a dead key.
+configuration each time the tunnel starts, not once at install. The gluetun
+image does it for you. Anywhere else, run `cyberghost-wg conf` right before the
+tunnel starts, and stop if it fails rather than starting with a dead key: with
+systemd, `ExecStartPre=` does exactly that, and `Restart=` tries again later
+when the network is not up yet at boot.
 
-### Podman Quadlet
-
-`~/.config/containers/systemd/gluetun.container`:
-
-```ini
-[Container]
-Image=docker.io/qmcgaw/gluetun
-AddCapability=NET_ADMIN
-AddDevice=/dev/net/tun
-Environment=VPN_SERVICE_PROVIDER=custom VPN_TYPE=wireguard
-Volume=%h/.config/cyberghost-wg/wg0.conf:/gluetun/wireguard/wg0.conf:ro,Z
-
-[Service]
-ExecStartPre=%h/.local/bin/cyberghost-wg conf --country CH --type torrent -o %h/.config/cyberghost-wg/wg0.conf
-Restart=on-failure
-RestartSec=60
-
-[Install]
-WantedBy=default.target
-```
-
-```bash
-cyberghost-wg login --remember     # once, as the same user
-loginctl enable-linger "$USER"     # once: start at boot without logging in
-systemctl --user daemon-reload && systemctl --user start gluetun
-```
-
-`Restart=` tries again a minute later when the network is not up yet at boot.
-The remembered credentials let `ExecStartPre` sign in again when the session
-expires; with `--instance NAME` instead of `--country`, no password is needed
-at all, but the tunnel fails if that server is retired.
-
-### Docker Compose
-
-Compose has no pre-start hook: generate the configuration right before bringing
-gluetun up, and recreate the container so that it reads the new file:
-
-```bash
-cyberghost-wg conf --country CH --type torrent -o ./gluetun/wg0.conf && docker compose up -d --force-recreate gluetun
-```
-
-Run the same line after a reboot: Docker restarts containers by itself, with
-the old configuration, whose key is dead by then.
+When the command runs unattended, it needs the credentials whenever the
+session (24 hours) has expired: remember them with `login --remember`, or give
+them as files (see [Credentials](#credentials)). With `--instance NAME` instead
+of `--country`, no password is needed at all, but the tunnel fails if that
+server is retired.
 
 ## How long a key lives
 
@@ -419,11 +369,10 @@ needs to read the machine's secret key itself, which systemd 257 refuses.
 | `refused the device (HTTP 401)` | This server does not accept the device; the next one is tried. If every server refuses it, the device was removed from the account (website, another `logout`): run `cyberghost-wg login`, which registers a new one. |
 | `HTTP 429` | Too many requests: the API blocks for about a minute. `cyberghost-wg` already waited once; wait and try again. |
 | `authentication refused` | Wrong username or password. If the password changed, run `login` again. |
-| `API unreachable` | No network or DNS yet (at boot), after three attempts. With the Quadlet above, systemd tries again a minute later. |
+| `API unreachable` | No network or DNS yet (at boot), after three attempts. The gluetun image exits and its restart policy tries again; elsewhere, let the service manager retry (systemd `Restart=`). |
 | `systemd 255 is too old to remember the credentials` | Use another credential source (see [Credentials](#credentials)), or run as root. |
 | `certificate issued to …, expected …` | The server's certificate does not match its name: the connection is refused, the next server is tried. If every server says so, CyberGhost changed its certificates: please open an issue. |
 | The tunnel is up but nothing goes through | The key was registered more than a few minutes before the tunnel came up: generate a new configuration and connect right away. |
-| `resolvconf: command not found` (wg-quick) | See [wg-quick](#use-with-wg-quick). |
 
 Run the failing command again with `-v` and add its output to an issue.
 

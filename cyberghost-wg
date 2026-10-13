@@ -66,9 +66,9 @@ NOSPY_COUNTRY = "RO"
 NAME_PREFIXES = ("nospyproxy", "nospy")
 ADDKEY_PORT = 1337
 DEFAULT_DNS = "10.101.0.243"  # fallback used by the official client
-# Everything through the tunnel. ::/0 too, although CyberGhost has no IPv6: with wg-quick
-# it sends IPv6 into the tunnel, where it is dropped, instead of leaking around it
-# (the official client disables IPv6 on the host for the same reason).
+# Everything through the tunnel. ::/0 too, although CyberGhost has no IPv6: a client that
+# routes AllowedIPs sends IPv6 into the tunnel, where it is dropped, instead of leaking
+# around it (the official client disables IPv6 on the host for the same reason).
 DEFAULT_ALLOWED_IPS = "0.0.0.0/0, ::/0"
 TIMEOUT = 20
 # Seconds to wait before each new attempt when the API is unreachable (network not up yet at boot).
@@ -1204,7 +1204,7 @@ def build_parser():
     s.add_argument("--keep-hostname", action="store_true",
                    help="write the hostname in Endpoint instead of its IPv4 address")
     s.add_argument("--no-dns", action="store_true",
-                   help="leave out the DNS line (wg-quick needs resolvconf for it)")
+                   help="leave out the DNS line, for clients that handle DNS themselves")
     s.add_argument("-o", "--output", help="output file, written with mode 0600 (default: stdout)")
 
     s = add("logout", cmd_logout, "delete the device from the account and remove the state file")
