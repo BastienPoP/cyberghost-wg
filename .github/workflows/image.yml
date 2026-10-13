@@ -51,7 +51,7 @@ jobs:
             type=raw,value=latest
           labels: |
             org.opencontainers.image.title=gluetun-cyberghost
-      - uses: docker/build-push-action@v6
+      - uses: docker/build-push-action@v7
         with:
           context: .
           file: gluetun/Dockerfile
