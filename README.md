@@ -43,8 +43,8 @@ and Windows are untested: reports are welcome.
 
 ```bash
 mkdir -p ~/.local/bin && cd ~/.local/bin
-curl -fsSLO https://github.com/BastienPoP/cyberghost-wg/releases/download/v0.1.0/cyberghost-wg
-curl -fsSLO https://github.com/BastienPoP/cyberghost-wg/releases/download/v0.1.0/SHA256SUMS
+curl -fsSLO https://github.com/BastienPoP/cyberghost-wg/releases/download/v0.2.0/cyberghost-wg
+curl -fsSLO https://github.com/BastienPoP/cyberghost-wg/releases/download/v0.2.0/SHA256SUMS
 sha256sum -c SHA256SUMS && rm SHA256SUMS && chmod +x cyberghost-wg
 cyberghost-wg --version
 ```

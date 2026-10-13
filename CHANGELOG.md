@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0 – 2026-10-13
 
 - gluetun image, `ghcr.io/bastienpop/gluetun-cyberghost` (amd64, arm64, armv7): gluetun with `cyberghost-wg` inside, which registers the device on the first start and writes a fresh configuration on every start. With a `compose.yaml`, a Podman Quadlet unit and its own README (`gluetun/`).
 - Docs: the README points gluetun users to the image.
