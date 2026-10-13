@@ -152,6 +152,8 @@ as `X.Y.Z` and `latest`.
 
 **gluetun updates** need no release: the base image is pinned in
 `gluetun/Dockerfile`, and Dependabot opens a pull request when a new gluetun is
-out. Merging it runs the `image` workflow, which republishes `latest` (the
-`X.Y.Z` tags keep the gluetun they were released with). Try the new gluetun
-first: its settings and log lines are documented in `gluetun/README.md`.
+out. The pull request builds the image for every platform and runs its smoke
+test, without publishing it; merging it runs the `image` workflow again, which
+republishes `latest` (the `X.Y.Z` tags keep the gluetun they were released
+with). Try the new gluetun first: its settings and log lines are documented in
+`gluetun/README.md`.

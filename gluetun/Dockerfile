@@ -15,8 +15,7 @@ LABEL org.opencontainers.image.title="gluetun-cyberghost" \
       org.opencontainers.image.source="https://github.com/BastienPoP/cyberghost-wg" \
       org.opencontainers.image.url="https://github.com/BastienPoP/cyberghost-wg/tree/main/gluetun" \
       org.opencontainers.image.documentation="https://github.com/BastienPoP/cyberghost-wg/blob/main/gluetun/README.md" \
-      org.opencontainers.image.licenses="MIT" \
-      org.opencontainers.image.base.name="ghcr.io/qdm12/gluetun:v3.41.3"
+      org.opencontainers.image.licenses="MIT"
 
 ENV VPN_SERVICE_PROVIDER=custom \
     VPN_TYPE=wireguard \
