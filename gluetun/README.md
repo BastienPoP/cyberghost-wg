@@ -86,17 +86,20 @@ Any other gluetun setting can be added to the file (see its
 [wiki](https://github.com/qdm12/gluetun-wiki)). `VPN_SERVICE_PROVIDER` and
 `VPN_TYPE` are set by the image: leave them alone.
 
-The credentials are **not** in `vpn.env`: they are Docker or Podman secrets,
-read from `/run/secrets/cg_username` and `/run/secrets/cg_password`. The
-password is needed on the first start, then whenever the CyberGhost session
-(24 hours) has expired.
+The credentials are best kept **out of** `vpn.env`, as secrets: files in
+`secrets/` with Docker, Podman secrets with Podman, which the container reads
+as `/run/secrets/cg_username` and `/run/secrets/cg_password`. The password is
+needed on the first start, then whenever the CyberGhost session (24 hours) has
+expired.
 
-Simpler but less private: put `CG_USERNAME=` and `CG_PASSWORD=` in `vpn.env`,
-and remove the secrets lines (`CG_USERNAME_FILE`, `CG_PASSWORD_FILE`,
-`secrets:` / `Secret=`) from `compose.yaml` or the unit; setting a variable and
-its `_FILE` together is an error. The password then shows in `docker inspect` /
-`podman inspect` and in the environment of the container's processes, and
-`vpn.env` must be kept private (mode `0600`).
+**Possible but not advised:** `CG_USERNAME=` and `CG_PASSWORD=` in `vpn.env`
+(commented out in the example). With Docker, that is all: `secrets/` can stay
+empty. With Podman, also remove the two `Secret=` lines of the unit, since
+Podman refuses to start a container whose secret does not exist. The variables
+win over the secrets. The password is then in clear text in `vpn.env` (keep it
+mode `0600`) and shown by `docker inspect` / `podman inspect`; the container
+logs a note about it at every start, and removes the variables before starting
+gluetun.
 
 ## Docker Compose
 
@@ -129,6 +132,14 @@ container. That user must be able to read `secrets/` and write to `state/`:
 Untested.
 
 ## Podman (Quadlet)
+
+> [!NOTE]
+> **Rootless Podman limits throughput and costs CPU.** Its user-mode network
+> (pasta) handles every encrypted UDP packet of the tunnel in user space: one
+> user [saw pasta use 80-100 % of a core at 50-500 Mbit/s](https://github.com/schmensch/homelab/tree/main/high-speed-wireguard-in-rootless-podman),
+> and we measured 42-50 Mbit/s through the tunnel against 572 Mbit/s without it
+> (3-vCPU arm64 VM, kernel WireGuard). Fine for modest needs; for more, run the
+> container rootful, or see that link for a rootless workaround.
 
 Rootless, as your user. With the unit file of this folder:
 
@@ -262,11 +273,6 @@ Clients have no access during all that time.
 | `NET_RAW` | Given by default: gluetun checks the tunnel with pings | Not given: gluetun checks with DNS queries and logs a `NET_RAW` notice, which is harmless |
 | Root | Root on the host, unless `userns-remap` | Your user (rootless) |
 
-**Throughput with rootless Podman** is limited by its user-mode network (pasta),
-which carries the encrypted packets: 42 to 50 Mbit/s through the tunnel against
-572 Mbit/s without it, measured on a 3-vCPU arm64 VM with kernel WireGuard. The
-image is the same either way; rootful containers do not have this limit.
-
 ## Tested
 
 Docker 29.9 with Compose v2, and Podman 5.4 rootless with Quadlet, on Debian 13
@@ -278,7 +284,8 @@ tunnel down for good. Not tested: `userns-remap`, amd64 and armv7 hosts.
 
 | Symptom | Fix |
 |---|---|
-| `secret cg_username not found`, or no such file `secrets/cg_username` | The credentials are missing: see the install steps |
+| `secret cg_username not found` (Podman) | The Podman secrets are missing: see the install steps, or remove the `Secret=` lines if the credentials are in `vpn.env` |
+| `credentials needed: run in a terminal, …` on the first start | No credentials at all: no file in `secrets/` (Docker), no Podman secret, nothing in `vpn.env` |
 | `authentication refused` on the first start | Wrong username or password: recreate the secrets, then restart |
 | `refused the device (HTTP 401)` from every server, after it worked | The device was removed from the account: delete `state/state.json` and restart; a new device is registered |
 | `HTTP 429` | Too many requests to the CyberGhost API; it lifts after about a minute, and the restart policy tries again |
@@ -289,7 +296,7 @@ tunnel down for good. Not tested: `userns-remap`, amd64 and armv7 hosts.
 | A client is `Up` but has no access (Docker) | gluetun restarted under it: `docker compose restart <client>` |
 | `WARN [dns] … running TLS handshake with 9.9.9.9:853 … connection reset by peer` | Quad9 dropped a connection; gluetun retries and the lookup succeeds. Only a problem if it never stops: try another `DNS_UPSTREAM_RESOLVERS` |
 | `listening for ICMP packets: not permitted: … NET_RAW` | Normal with Podman: gluetun checks the tunnel with DNS instead of pings |
-| Slow | No `Using available kernelspace implementation` line: the `wireguard` module is missing on the host. Otherwise, see the throughput note above |
+| Slow | No `Using available kernelspace implementation` line: the `wireguard` module is missing on the host. Otherwise, see the note at the top of the Podman section |
 
 ## Security
 
@@ -298,7 +305,7 @@ tunnel down for good. Not tested: `userns-remap`, amd64 and armv7 hosts.
   every device with its secret). If it leaks, change your CyberGhost password
   and remove the devices from your account.
 - The credentials are secrets (files readable by you only with Docker).
-  `vpn.env` holds no secret.
+  `vpn.env` holds no secret, unless you put the account in it.
 - The WireGuard private key only exists inside the container
   (`/gluetun/wireguard/wg0.conf`, mode `0600`) and changes on every start. The
   logs hold no key and no token.

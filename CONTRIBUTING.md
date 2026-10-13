@@ -150,8 +150,8 @@ CHANGELOG section as notes. The `image` workflow builds the gluetun image for
 amd64, arm64 and armv7 and pushes it to `ghcr.io/bastienpop/gluetun-cyberghost`
 as `X.Y.Z` and `latest`.
 
-**gluetun updates** need no release: Dependabot opens a pull request when a new
-gluetun image is out; after merging it, run the `image` workflow by hand
-(Actions → image → Run workflow), which republishes `latest`. Try the new
-gluetun first: its settings and log lines are documented in
-`gluetun/README.md`.
+**gluetun updates** need no release: the base image is pinned in
+`gluetun/Dockerfile`, and Dependabot opens a pull request when a new gluetun is
+out. Merging it runs the `image` workflow, which republishes `latest` (the
+`X.Y.Z` tags keep the gluetun they were released with). Try the new gluetun
+first: its settings and log lines are documented in `gluetun/README.md`.

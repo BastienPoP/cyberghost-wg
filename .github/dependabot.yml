@@ -1,5 +1,5 @@
 # Weekly pull requests for a new gluetun base image and new action versions.
-# After merging a gluetun update, run the image workflow by hand to publish it.
+# Merging a gluetun update publishes the image as latest (image workflow).
 version: 2
 updates:
   - package-ecosystem: docker

@@ -3,11 +3,14 @@ name: image
 # Builds the gluetun image (gluetun/Dockerfile) and pushes it to
 # ghcr.io/bastienpop/gluetun-cyberghost:
 # - on a release tag such as v0.2.0: as 0.2.0 and latest;
-# - by hand (Actions > image > Run workflow): as latest, e.g. after a gluetun
-#   update that needs no new release of the script.
+# - when gluetun/Dockerfile changes on main (a gluetun update merged from
+#   Dependabot): as latest, with no new release of the script;
+# - by hand (Actions > image > Run workflow): as latest.
 on:
   push:
     tags: ["v*"]
+    branches: [main]
+    paths: [gluetun/Dockerfile]
   workflow_dispatch:
 
 permissions:

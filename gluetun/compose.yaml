@@ -1,6 +1,6 @@
 # gluetun with a fresh CyberGhost WireGuard configuration on every start.
-# Needs, next to this file: vpn.env, secrets/cg_username, secrets/cg_password
-# and the state/ folder (see README.md).
+# Needs, next to this file: vpn.env, the state/ folder and the credentials in
+# secrets/cg_username and secrets/cg_password (see README.md).
 services:
   gluetun:
     image: ghcr.io/bastienpop/gluetun-cyberghost:latest
@@ -18,14 +18,10 @@ services:
     sysctls:
       - net.ipv6.conf.all.disable_ipv6=1
     env_file: vpn.env
-    environment:
-      CG_USERNAME_FILE: /run/secrets/cg_username
-      CG_PASSWORD_FILE: /run/secrets/cg_password
-    secrets:
-      - cg_username
-      - cg_password
     volumes:
       - ./state:/cyberghost-wg
+      # The credentials, read as /run/secrets/cg_username and cg_password.
+      - ./secrets:/run/secrets:ro
     # gluetun's own health check, with more time for cyberghost-wg at start;
     # images built with Podman (OCI format) would lose it without this.
     healthcheck:
@@ -46,9 +42,3 @@ services:
   #       condition: service_healthy
   #       restart: true
   #   restart: unless-stopped
-
-secrets:
-  cg_username:
-    file: ./secrets/cg_username
-  cg_password:
-    file: ./secrets/cg_password

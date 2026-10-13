@@ -1,7 +1,7 @@
 # gluetun with a fresh CyberGhost WireGuard configuration on every start, as a
 # rootless Podman Quadlet: copy to ~/.config/containers/systemd/ (see README.md).
 # Needs ~/.config/gluetun-cyberghost/vpn.env, its state/ folder and the Podman
-# secrets cg_username and cg_password.
+# secrets cg_username and cg_password (read as /run/secrets/cg_username...).
 [Unit]
 Description=gluetun (CyberGhost WireGuard)
 StartLimitIntervalSec=0
@@ -15,7 +15,6 @@ AddDevice=/dev/net/tun
 # clients would try it first and wait for gluetun's firewall to block it.
 Sysctl=net.ipv6.conf.all.disable_ipv6=1
 EnvironmentFile=%h/.config/gluetun-cyberghost/vpn.env
-Environment=CG_USERNAME_FILE=/run/secrets/cg_username CG_PASSWORD_FILE=/run/secrets/cg_password
 Secret=cg_username
 Secret=cg_password
 Volume=%h/.config/gluetun-cyberghost/state:/cyberghost-wg
